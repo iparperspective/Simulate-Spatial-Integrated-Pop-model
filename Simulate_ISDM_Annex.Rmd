@@ -1,0 +1,518 @@
+---
+title: "ISDM performance simulation"
+author: "Iosu Paradinas"
+date: '2022-07-12'
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(INLA)
+library(scales)
+library(raster)
+library(tidyverse)
+library(gridExtra)
+library(patchwork)
+library(cowplot)
+
+
+```
+
+The code in this document was used to perform the simulation study of the manuscript.
+
+# Simulate Sp field
+
+```{r simsp}
+## Field
+dims = 101
+mat = matrix(1,ncol=dims,nrow=dims)
+
+##########################
+##### spatial field #####
+######################
+yticks <- xticks <-seq(-3, 3, length=dims)
+side <- diff(yticks[1:2])  # side length of squares
+sigma <- diag(2)               # standard devs. for f2
+mu <- c(0,0)                # means
+
+## Using pnorm
+f <- Vectorize(function(x, y, side, mu1, mu2, s1, s2)
+  diff(pnorm(x+c(-1,1)*side/2, mu1, s1)) * diff(pnorm(y+c(-1,1)*side/2, mu2, s2)),
+  vec=c("x", "y"))
+
+## get prob. of squares, mu are means, s are standards devs.
+mat <- outer(xticks, yticks, f, side=side, mu1=0, mu2=0, s1=1,s2=1)
+mat =  rescale(mat,to=c(-1,1))
+space <-raster(
+  mat,
+  xmn=1, xmx=dims,
+  ymn=1, ymx=dims
+)
+
+plot(space)
+space_effect = space@data@values
+lon=coordinates(space)[,1]
+lat=coordinates(space)[,2]
+
+###############################
+### Covariate ######
+min_Cov=0;max_Cov=30
+Cov_profile = round(rescale(lon^2.5,to=c(min_Cov,max_Cov)) )+1## same in Y axis
+effect_Cov =  dnorm(Cov_profile,10,4)
+effect_Cov <- rescale(effect_Cov,to=c(-1.5,1.5))
+plot(Cov_profile,effect_Cov)
+
+all_data = data.frame(Cov_effect= effect_Cov ,
+                       Cov=round(inla.group(Cov_profile,n=15)),
+                      lon=lon,
+                      lat=lat,
+                      Space=space_effect,
+                      Sp_Mean = effect_Cov+space_effect
+                      #y=d1$y
+)
+
+a = ggplot(all_data) + geom_raster(aes(x=lon,y=lat,fill=Cov)) + ggtitle("Covariate field")
+b = ggplot(all_data) + geom_raster(aes(x=lon,y=lat,fill=Cov_effect)) + ggtitle("Covariate effect")
+c = ggplot(all_data) + geom_raster(aes(x=lon,y=lat,fill=Space)) + ggtitle("Residual spatial field")
+d = ggplot(all_data) + geom_raster(aes(x=lon,y=lat,fill=Sp_Mean)) + ggtitle("Species distribution")
+gridExtra::grid.arrange(a,b,c,d,ncol=2)
+
+```
+
+# Simulate three datasets
+
+```{r sim data}
+scale2 = .5
+scale3 = .8
+n = dims^2
+
+#### biomass data
+intercept1 = -1
+effort1 = sample(1:5, n, replace=TRUE)
+nu1 = intercept1 +  
+  effect_Cov + space_effect
+mu1 = exp(nu1+log(effort1))
+
+prec.scale = .5
+prec.par = 4
+a = prec.par * prec.scale
+b = mu1 / (prec.par * prec.scale)
+y1 = rgamma(n, shape = a, scale = b)
+
+### count
+intercept2 = 2
+effort2 = sample(1:2, n, replace=TRUE)
+nu2 = scale2*(intercept2 +  
+                effect_Cov + space_effect ) 
+mu2 = exp(nu2+log(effort2))
+y2 = rpois(n, lambda = mu2)
+
+
+### occurrence
+intercept3 = -.5
+logit = function(x) log(x/(1-x))
+inv.logit = function(x) exp(x)/(1+exp(x))
+effort3 = sample(1:2, n, replace=TRUE)
+nu3 = scale3*(intercept3 +  
+                effect_Cov + space_effect + effort3) ### I dont know how to enter effort in a logit
+mu3 = inv.logit(nu3)
+y3 = rbinom(n, size = 1, prob = mu3)
+
+all_data = data.frame(mean_biomass=mu1,
+                      mean_count=mu2,
+                      mean_occur=mu3,
+                      obs_biomass=y1,obs_count=y2,obs_occur=y3,
+                      Cov=round(inla.group(Cov_profile,n=15)),
+                      Cov_effect= effect_Cov ,
+                      lon=lon,
+                      lat=lat,
+                      space=space_effect,
+                      mean = effect_Cov+space_effect
+                      #y=d1$y
+)
+a
+aa = ggplot(all_data) + geom_raster(aes(x=lon,y=lat,fill=log(mean_biomass)))
+bb = ggplot(all_data) + geom_raster(aes(x=lon,y=lat,fill=log(mean_count)))
+cc = ggplot(all_data) + geom_raster(aes(x=lon,y=lat,fill=mean_occur))
+aa;bb;cc
+
+```
+
+
+# Create Surveys
+
+```{r sim survey}
+lower_bound=8
+upper_bound=12
+n=200
+survey1_idx = survey2_idx = survey3_idx = c()
+for(i in 1:n){
+  a.idx=5
+  b.idx=15
+  while(a.idx<lower_bound){
+    ea1 = sample(1:nrow(all_data),1)
+    a.idx=all_data$Cov[ea1]
+  }
+  while( b.idx>upper_bound){
+    ea2 = sample(1:nrow(all_data),1)
+    b.idx=all_data$Cov[ea2]
+  }
+  
+  survey1_idx[i]=ea1
+  survey2_idx[i]=ea2
+}
+
+survey3_idx = sample(1:nrow(all_data),n)
+
+pred_surv1 = all_data[which(all_data$Cov>lower_bound),]
+pred_surv2 = all_data[which(all_data$Cov<upper_bound),]
+pred_surv3 = all_data
+
+survey1 = all_data[survey1_idx,]
+survey2 = all_data[survey2_idx,]
+survey3 = all_data[survey3_idx,]
+
+occur_survey_plot = ggplot() + geom_raster(data=all_data,aes(x=lon,y=lat,fill=scale(mean_biomass)))+ 
+  scale_fill_distiller(type = "seq",
+                        direction = -1,
+                        palette = "Greys")  + 
+  geom_point(data=survey3,aes(x=lon,y=lat),color="red",shape=1,alpha=.5)+
+  theme_bw()+ggtitle("Presence-absence data") + ylab("Latitude")+ xlab("Longitude")+ 
+  theme(legend.position="none")
+
+biomass_survey_plot = ggplot() + geom_raster(data=all_data,aes(x=lon,y=lat,fill=scale(mean_biomass)))+ 
+  scale_fill_distiller(type = "seq",
+                       direction = -1,
+                       palette = "Greys")  + 
+  geom_point(data=survey1,aes(x=lon,y=lat),color="red",shape=1,alpha=.5) +
+  theme_bw()+ggtitle("Biomass data") + ylab("Latitude")+ xlab("Longitude")+ 
+  theme(legend.position="none")
+
+abundance_survey_plot = ggplot() + geom_raster(data=all_data,aes(x=lon,y=lat,fill=scale(mean_biomass)))+ 
+  scale_fill_distiller(type = "seq",
+                       direction = -1,
+                       palette = "Greys")  + 
+  geom_point(data=survey2,aes(x=lon,y=lat),color="red",shape=1,alpha=.5)+
+  theme_bw()+ggtitle("Abundance data") + ylab("Latitude")+ xlab("Longitude")+ 
+  theme(legend.position="none")
+
+bbbb = ggplot() + geom_raster(data=all_data,aes(x=lon,y=lat,fill=Cov_effect))+ 
+  scale_fill_distiller(type = "seq",
+                       direction = -1,
+                       palette = "Greys")  + 
+  theme_bw()+ggtitle("Covariate field") + ylab("Latitude")+ xlab("Longitude")+
+  theme(legend.position="none")
+
+ssss = ggplot() + geom_raster(data=all_data,aes(x=lon,y=lat,fill=space))+ 
+  scale_fill_distiller(type = "seq",
+                       direction = -1,
+                       palette = "Greys")  + 
+  theme_bw()+ggtitle("Spatial field") + ylab("Latitude")+ xlab("Longitude") +
+  theme(legend.position="none")
+
+
+ffff = ggplot() + geom_raster(data=all_data,aes(x=lon,y=lat,fill=mean))+ 
+  scale_fill_distiller(type = "seq",
+                       direction = -1,
+                       palette = "Greys")  + 
+  theme_bw()+ggtitle("Simulated process") + ylab("Latitude")+ xlab("Longitude")
+
+ggdraw() +
+  draw_plot(bbbb, 0.33/4, 0.5, .4, .5) +
+  draw_plot(ssss, 0.66-0.33/3, .5, .4, .5) +
+  draw_plot(abundance_survey_plot, 0, 0, .33, .5) +
+  draw_plot(biomass_survey_plot, 0.33, 0, .33, .5) +
+  draw_plot(occur_survey_plot, 0.66, 0, .33, .5) 
+
+
+```
+
+
+# Fit models
+
+```{r fit models,fig.height=12,fig.width=12}
+
+d1=cbind(survey1$lon,survey1$lat)
+d2=cbind(survey2$lon,survey2$lat)
+d3=cbind(survey3$lon,survey3$lat)
+
+#### mesh
+max.edge = dims*.05
+bound.outer = .3
+mesh = inla.mesh.2d(loc.domain = cbind(c(0,dims,dims,0,0),c(0,0,dims,dims,0)),
+                    #loc=cbind(sample_data$km_utm.x, sample_data$km_utm.y),
+                    max.edge = c(1,5)*max.edge,
+                    cutoff = .5,
+                    offset = c(max.edge, -bound.outer))
+
+
+####### spatial field structure
+spde  = inla.spde2.pcmatern(mesh, prior.range = c(2,.5), prior.sigma = c(1,.01))
+
+A1 <- inla.spde.make.A(mesh, loc=d1)
+A2 <- inla.spde.make.A(mesh, loc=d2)
+A3 <- inla.spde.make.A(mesh, loc=d3)
+
+
+#########################
+###### DATA prep ######
+#####################
+
+######################
+### biomass data ###
+###################
+A.survey1 <- inla.spde.make.A(mesh, loc=cbind(survey1$lon,survey1$lat))
+stack_survey1_alone<-inla.stack(data=list(y=survey1$obs_biomass),
+                                A=list(A.survey1, 1),
+                                effects=list(spat1=1:spde$n.spde,
+                                             list(b0_1=1,
+                                                  Cov1=survey1$Cov)),
+                                tag='est_surv1')
+
+### for integrated modelling ####
+Cov_notin_survey1 = which(!unique(all_data$Cov)%in%survey1$Cov)
+Cov_combined_survey1_NAs = unique(all_data$Cov)[Cov_notin_survey1]
+
+survey1_NA = rep(NA,length(Cov_notin_survey1))
+A.survey1_NA <- inla.spde.make.A(mesh, loc=matrix(c(c(survey1$lon,survey1_NA),
+                                                    c(survey1$lat,survey1_NA)),ncol=2))
+
+
+stack_survey1<-inla.stack(data=list(y=cbind(c(survey1$obs_biomass,survey1_NA),NA,NA)),
+                          A=list(A.survey1_NA, 1),
+                          effects=list(spat1=1:spde$n.spde,
+                                       list(b0_1=1,
+                                            Cov1=c(survey1$Cov,Cov_combined_survey1_NAs))),
+                          tag='est_surv1')
+
+#####################
+### count data ####
+#################
+A.survey2 <- inla.spde.make.A(mesh, loc=cbind(survey2$lon,survey2$lat))
+
+stack_survey2_alone<-inla.stack(data=list(y=survey2$obs_count),
+                                A=list(A.survey2, 1),
+                                effects=list(spat2=1:spde$n.spde,
+                                             list(b0_2=1,
+                                                  Cov2=survey2$Cov)),
+                                tag='est_surv2')
+
+### for integrated modelling ####
+Cov_notin_survey2 = which(!unique(all_data$Cov)%in%survey2$Cov)
+Cov_combined_survey2_NAs = unique(all_data$Cov)[Cov_notin_survey2]
+
+survey2_NA = rep(NA,length(Cov_notin_survey2))
+A.survey2_NA <- inla.spde.make.A(mesh, loc=matrix(c(c(survey2$lon,survey2_NA),
+                                                    c(survey2$lat,survey2_NA)),ncol=2))
+
+stack_survey2<-inla.stack(data=list(y=cbind(NA,c(survey2$obs_count,survey2_NA),NA)),
+                          A=list(A.survey2_NA, 1),
+                          effects=list(spat2=1:spde$n.spde,
+                                       list(b0_2=1,
+                                            Cov2=c(survey2$Cov,Cov_combined_survey2_NAs))),
+                          tag='est_surv2')
+
+
+#########################
+### Occurrence data ###
+######################
+stack_survey3_alone<-inla.stack(data=list(y=survey3$obs_occur),
+                                A=list(A3, 1),
+                                effects=list(spat3=1:spde$n.spde,
+                                             list(b0_3=1,
+                                                  Cov3=survey3$Cov)),
+                                tag='est_surv3')
+
+stack_survey3<-inla.stack(data=list(y=cbind(NA,NA,survey3$obs_occur)),
+                          A=list(A3, 1),
+                          effects=list(spat3=1:spde$n.spde,
+                                       list(b0_3=1,
+                                            Cov3=survey3$Cov)),
+                          tag='est_surv3')
+
+
+stack_combined_survey = inla.stack(stack_survey1,stack_survey2,stack_survey3)
+
+
+
+
+##################################
+##### independent modelling ####
+#############################
+
+rw_prior = list(theta = list(prior="pc.prec", param=c(2,0.99),initial=9))
+
+survey_biomass = inla(y ~  -1  +  b0_1 +
+                        f(Cov1,model="rw2",hyper = rw_prior) +
+                        f(spat1,model=spde),
+                      family=c("gamma"),control.inla = list(strategy = "simplified.laplace"),
+                      data=inla.stack.data(stack_survey1_alone), control.compute=list(waic=F,cpo=F,config=F),
+                      control.predictor=list(A=inla.stack.A(stack_survey1_alone), compute=F,link=1),
+                      #control.fixed = list(expand.factor.strategy = "inla"),
+                      verbose=F,num.threads = 2)
+
+spat_potdata=data.frame(Lon = mesh$loc[,1],Lat=mesh$loc[,2],
+                        Mean = survey_biomass$summary.random$spat1$mean)
+biom_spat = ggplot(spat_potdata) + geom_point(aes(x=Lon,y=Lat,color=Mean),size=4)+ xlim(0,dims)+ ylim(0,dims)+
+  theme_bw()+ggtitle("SDM biomass") + geom_point(data=survey1,aes(x=lon,y=lat),color="red",shape=1,alpha=.5) + theme(legend.position = "none") + 
+  scale_color_distiller(type = "seq",
+                       direction = -1,
+                       palette = "Greys")
+
+Cov_plot_data = data.frame(Mean = survey_biomass$summary.random$Cov1$mean,
+                             Q_0.025 = survey_biomass$summary.random$Cov1$`0.025quant`,
+                             Q_0.975 = survey_biomass$summary.random$Cov1$`0.975quant`,
+                             Cov = survey_biomass$summary.random$Cov1$ID)
+biom_Cov = ggplot(Cov_plot_data) + 
+  geom_line(aes(x=Cov,y=Mean))+ 
+  geom_line(aes(x=Cov,y=Q_0.025),linetype ="dashed")+ 
+  geom_line(aes(x=Cov,y=Q_0.975),linetype ="dashed")+theme_bw()+ggtitle("SDM biomass") +xlim(range(all_data$Cov))+ ylab("Covariate effect")
+#biom_Cov
+
+survey_count = inla(y ~  -1  +  b0_2 +
+                      f(Cov2,model="rw2",hyper = rw_prior) +
+                      f(spat2,model=spde),
+                    family=c("poisson"),control.inla = list(strategy = "simplified.laplace"),
+                    data=inla.stack.data(stack_survey2_alone), control.compute=list(waic=T,cpo=F,config=F),
+                    control.predictor=list(A=inla.stack.A(stack_survey2_alone), compute=F,link=1),
+                    #control.fixed = list(expand.factor.strategy = "inla"),
+                    verbose=F,num.threads = 2)
+
+spat_potdata=data.frame(Lon = mesh$loc[,1],Lat=mesh$loc[,2],
+                        Mean = survey_count$summary.random$spat2$mean)
+count_spat = ggplot(spat_potdata) + geom_point(aes(x=Lon,y=Lat,color=Mean),size=4)+ xlim(0,dims)+ ylim(0,dims)+
+  theme_bw()+ggtitle("SDM count") + geom_point(data=survey2,aes(x=lon,y=lat),color="red",shape=1,alpha=.5) + theme(legend.position = "none") + 
+  scale_color_distiller(type = "seq",
+                       direction = -1,
+                       palette = "Greys")
+
+Cov_plot_data = data.frame(Mean = survey_count$summary.random$Cov2$mean,
+                             Q_0.025 = survey_count$summary.random$Cov2$`0.025quant`,
+                             Q_0.975 = survey_count$summary.random$Cov2$`0.975quant`,
+                             Cov = survey_count$summary.random$Cov2$ID)
+count_Cov = ggplot(Cov_plot_data) + 
+  geom_line(aes(x=Cov,y=Mean))+ 
+  geom_line(aes(x=Cov,y=Q_0.025),linetype ="dashed")+ 
+  geom_line(aes(x=Cov,y=Q_0.975),linetype ="dashed")+theme_bw()+ggtitle("SDM count")+xlim(range(all_data$Cov))+ ylab("Covariate effect")
+#count_Cov
+
+
+survey_occurrence = inla(y ~  -1  +  b0_3 +
+                           f(Cov3,model="rw2",hyper = rw_prior) +
+                           f(spat3,model=spde),
+                         family=c("binomial"),control.inla = list(strategy = "simplified.laplace"),
+                         data=inla.stack.data(stack_survey3_alone), control.compute=list(waic=T,cpo=F,config=F),
+                         control.predictor=list(A=inla.stack.A(stack_survey3_alone), compute=F,link=1),
+                         #control.fixed = list(expand.factor.strategy = "inla"),
+                         verbose=F,num.threads = 2)
+
+spat_potdata=data.frame(Lon = mesh$loc[,1],Lat=mesh$loc[,2],
+                        Mean = survey_occurrence$summary.random$spat3$mean)
+occur_spat = ggplot(spat_potdata) + geom_point(aes(x=Lon,y=Lat,color=Mean),size=4)+ xlim(0,dims)+ ylim(0,dims)+
+  theme_bw()+ggtitle("SDM occurrence") + geom_point(data=survey3,aes(x=lon,y=lat),color="red",shape=1,alpha=.5) + theme(legend.position = "none") + 
+  scale_color_distiller(type = "seq",
+                       direction = -1,
+                       palette = "Greys")
+
+Cov_plot_data = data.frame(Mean = survey_occurrence$summary.random$Cov3$mean,
+                             Q_0.025 = survey_occurrence$summary.random$Cov3$`0.025quant`,
+                             Q_0.975 = survey_occurrence$summary.random$Cov3$`0.975quant`,
+                             Cov = survey_occurrence$summary.random$Cov3$ID)
+occur_Cov = ggplot(Cov_plot_data) + 
+  geom_line(aes(x=Cov,y=Mean))+ 
+  geom_line(aes(x=Cov,y=Q_0.025),linetype ="dashed")+ 
+  geom_line(aes(x=Cov,y=Q_0.975),linetype ="dashed")+theme_bw()+ggtitle("SDM occurrence")+xlim(range(all_data$Cov))+ ylab("Covariate effect")
+
+
+
+###########################################
+######### integrated modelling ########
+####################################
+survey_integrated = inla(y ~  -1  +  b0_2 +  b0_1 + b0_3 +
+                           f(Cov1,model="rw2",hyper = rw_prior) + 
+                           f(Cov2,copy = "Cov1",fixed=F)+
+                           f(Cov3,copy = "Cov1",fixed=F)+
+                           f(spat1,model=spde) +
+                           f(spat2,copy = "spat1",fixed=F) +
+                           f(spat3,copy = "spat1",fixed=F),
+                         family=c("gamma","poisson","binomial"),control.inla = list(strategy = "simplified.laplace"),
+                         data=inla.stack.data(stack_combined_survey), control.compute=list(waic=T,cpo=F,config=F),
+                         control.predictor=list(A=inla.stack.A(stack_combined_survey), compute=T,link=1),
+                         verbose=F,num.threads = 2)
+
+spat_potdata=data.frame(Lon = mesh$loc[,1],Lat=mesh$loc[,2],
+                        Mean_biom = survey_integrated$summary.random$spat1$mean,
+                        Mean_count = survey_integrated$summary.random$spat2$mean,
+                        Mean_occur = survey_integrated$summary.random$spat3$mean)
+int_biom_spat = ggplot(spat_potdata) + geom_point(aes(x=Lon,y=Lat,color=Mean_biom),size=4) + xlim(0,dims)+ ylim(0,dims)+
+  theme_bw()+ggtitle("ISDM biomass") + theme(legend.position = "none")+ theme(legend.position = "none")+ 
+  scale_color_distiller(type = "seq",
+                       direction = -1,
+                       palette = "Greys")
+int_count_spat = ggplot(spat_potdata) + geom_point(aes(x=Lon,y=Lat,color=Mean_count),size=4)+ xlim(0,dims)+ ylim(0,dims)+
+  theme_bw()+ggtitle("ISDM count") + theme(legend.position = "none")+ theme(legend.position = "none")+ 
+  scale_color_distiller(type = "seq",
+                       direction = -1,
+                       palette = "Greys")
+int_occur_spat = ggplot(spat_potdata) + geom_point(aes(x=Lon,y=Lat,color=Mean_occur),size=4)+ xlim(0,dims)+ ylim(0,dims)+
+  theme_bw()+ggtitle("ISDM occurrence") + theme(legend.position = "none")+ theme(legend.position = "none")+ 
+  scale_color_distiller(type = "seq",
+                       direction = -1,
+                       palette = "Greys")
+
+Cov_plot_data = data.frame(Mean_biom = survey_integrated$summary.random$Cov1$mean,
+                             Q_0.025_biom = survey_integrated$summary.random$Cov1$`0.025quant`,
+                             Q_0.975_biom = survey_integrated$summary.random$Cov1$`0.975quant`,
+                             Mean_count = survey_integrated$summary.random$Cov2$mean,
+                             Q_0.025_count = survey_integrated$summary.random$Cov2$`0.025quant`,
+                             Q_0.975_count = survey_integrated$summary.random$Cov2$`0.975quant`,
+                             Mean_occur = survey_integrated$summary.random$Cov3$mean,
+                             Q_0.025_occur = survey_integrated$summary.random$Cov3$`0.025quant`,
+                             Q_0.975_occur = survey_integrated$summary.random$Cov3$`0.975quant`,
+                             Cov = survey_integrated$summary.random$Cov3$ID)
+biom_Cov_int = ggplot(Cov_plot_data) + 
+  geom_line(aes(x=Cov,y=Mean_biom))+ 
+  geom_line(aes(x=Cov,y=Q_0.025_biom),linetype ="dashed")+ 
+  geom_line(aes(x=Cov,y=Q_0.975_biom),linetype ="dashed")+theme_bw()+ggtitle("ISDM biomass")+xlim(range(all_data$Cov))+ ylab("Covariate effect")+ 
+  scale_fill_distiller(type = "seq",
+                       direction = -1,
+                       palette = "Greys")
+
+count_Cov_int = ggplot(Cov_plot_data) + 
+  geom_line(aes(x=Cov,y=Mean_count))+ 
+  geom_line(aes(x=Cov,y=Q_0.025_count),linetype ="dashed")+ 
+  geom_line(aes(x=Cov,y=Q_0.975_count),linetype ="dashed")+theme_bw()+ggtitle("ISDM count")+xlim(range(all_data$Cov))+ ylab("Covariate effect")+ 
+  scale_fill_distiller(type = "seq",
+                       direction = -1,
+                       palette = "Greys")
+
+occur_Cov_int = ggplot(Cov_plot_data) + 
+  geom_line(aes(x=Cov,y=Mean_occur))+ 
+  geom_line(aes(x=Cov,y=Q_0.025_occur),linetype ="dashed")+ 
+  geom_line(aes(x=Cov,y=Q_0.975_occur),linetype ="dashed") +theme_bw()+ggtitle("ISDM occurrence")+
+  xlim(range(all_data$Cov)) + ylab("Covariate effect") + 
+  scale_fill_distiller(type = "seq",
+                       direction = -1,
+                       palette = "Greys")
+
+
+#### real fields ###
+real_spat_plot = ggplot(all_data) + geom_raster(aes(x=lon,y=lat,fill=space))+ xlim(0,dims)+ ylim(0,dims)+
+  theme_bw()+ggtitle("Real spatial effect") + ylab("Lat") + xlab("Lon") + theme(legend.position = "none") + 
+  scale_fill_distiller(type = "seq",
+                       direction = -1,
+                       palette = "Greys")
+
+real_Cov_data =data.frame(Cov = Cov_profile,Std_effect = effect_Cov)
+real_Cov_plot = ggplot(real_Cov_data) + ylab("Standardised eff")+
+  geom_line(aes(x=Cov,y=Std_effect))  +theme_bw()+ggtitle("Real Covmetric effect")+xlim(range(all_data$Cov))
+
+### Cov plot
+plot_spacer() + real_Cov_plot + plot_spacer() + biom_Cov + count_Cov + occur_Cov + biom_Cov_int + count_Cov_int + occur_Cov_int
+
+### spatial plot
+plot_spacer() + real_spat_plot + plot_spacer() + biom_spat + count_spat + occur_spat + int_biom_spat + int_count_spat + int_occur_spat
+
+```
+
